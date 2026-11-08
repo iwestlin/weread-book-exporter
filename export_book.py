@@ -114,8 +114,8 @@ def refine_chapter_text(text):
     return res
 
 
-def read_book(book_id):
-    root = os.path.join(BASE, "output", book_id + "_v2")
+def read_book(book_id, dir_suffix="_v2"):
+    root = os.path.join(BASE, "output", book_id + dir_suffix)
     ch_dir = os.path.join(root, "chapters")
     head_dir = os.path.join(root, "_head")
     raw_dir = os.path.join(root, "raw")
@@ -128,7 +128,7 @@ def read_book(book_id):
             print(f"🔄 检测到 chapters 章节目录为空，正在从 raw/ 逐页落盘数据 ({len(raw_pages)} 页) 自动恢复章节...")
             try:
                 import crawl_weread
-                rebuilt_cnt = crawl_weread.rebuild_chapters_from_raw(book_id)
+                rebuilt_cnt = crawl_weread.rebuild_chapters_from_raw(book_id, dir_suffix)
                 print(f"✅ 成功从历史落盘记录中重构恢复了 {rebuilt_cnt} 个完整章节！")
             except Exception as e:
                 print(f"⚠️ 自动重构章节提示: {e}")
@@ -157,12 +157,12 @@ def read_book(book_id):
     return root, heads + chaps
 
 
-def build_markdown_files(book_id, title, texts):
+def build_markdown_files(book_id, title, texts, out_tag=""):
     out_dir = os.path.join(BASE, "output")
     os.makedirs(out_dir, exist_ok=True)
     refined = [refine_chapter_text(t) for t in texts]
 
-    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    safe_title = (re.sub(r'[<>:"/\\|?*]', "_", title) or book_id) + out_tag
     html_md_path = os.path.join(out_dir, f"{safe_title}_全书合并_HTML排版版.md")
     with open(html_md_path, "w", encoding="utf-8") as f:
         f.write("\n\n---\n\n".join(refined))
@@ -181,7 +181,7 @@ def build_markdown_files(book_id, title, texts):
     return pure_md_path
 
 
-def build_epub(book_id, root, title, author, texts):
+def build_epub(book_id, root, title, author, texts, out_tag=""):
     try:
         import markdown
         from ebooklib import epub
@@ -235,7 +235,7 @@ def build_epub(book_id, root, title, author, texts):
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + items
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    safe = (re.sub(r'[<>:"/\\|?*]', "_", title) or book_id) + out_tag
     out_epub = os.path.join(BASE, "output", f"{safe}（双字体精排）.epub")
     epub.write_epub(out_epub, book)
     print(f"📘 EPUB 电子书生成完成: {out_epub}", flush=True)
@@ -300,7 +300,7 @@ async def launch_browser_headless(p):
     raise RuntimeError("未检测到可用浏览器渲染 PDF，请安装 Google Chrome 或 Microsoft Edge")
 
 
-async def build_pdf(book_id, root, title, author, intro, texts):
+async def build_pdf(book_id, root, title, author, intro, texts, out_tag=""):
     img_dir = os.path.join(root, "images")
     cover_path = os.path.join(root, "cover.jpg")
     cover_uri = img_to_data_uri(cover_path)
@@ -408,8 +408,8 @@ p.yw {{
 </body>
 </html>"""
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
-    html_path = os.path.join(BASE, "output", f"_temp_{book_id}.html")
+    safe = (re.sub(r'[<>:"/\\|?*]', "_", title) or book_id) + out_tag
+    html_path = os.path.join(BASE, "output", f"_temp_{book_id}{out_tag}.html")
     pdf_path = os.path.join(BASE, "output", f"{safe}（双字体精排）.pdf")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -424,17 +424,19 @@ p.yw {{
         file_url = "file:///" + os.path.abspath(html_path).replace("\\", "/")
         await page.goto(file_url, wait_until="networkidle", timeout=60000)
         await page.evaluate("() => document.fonts.ready")
-        await page.pdf(
-            path=pdf_path,
-            format="A4",
-            print_background=True,
-            display_header_footer=True,
-            header_template=header_tmpl,
-            footer_template=footer_tmpl,
-            margin={"top": "20mm", "bottom": "19mm", "left": "16.5mm", "right": "16.5mm"},
-            tagged=True,
-            outline=True,
-        )
+        pdf_kwargs = {
+            "path": pdf_path,
+            "format": "A4",
+            "print_background": True,
+            "display_header_footer": True,
+            "header_template": header_tmpl,
+            "footer_template": footer_tmpl,
+            "margin": {"top": "20mm", "bottom": "19mm", "left": "16.5mm", "right": "16.5mm"},
+        }
+        try:
+            await page.pdf(tagged=True, outline=True, **pdf_kwargs)
+        except TypeError:
+            await page.pdf(**pdf_kwargs)
         await browser.close()
 
     if os.path.isfile(html_path):
@@ -443,15 +445,15 @@ p.yw {{
     return pdf_path
 
 
-async def main(book_id_or_url):
+async def main(book_id_or_url, dir_suffix="_v2", out_tag=""):
     book_id = extract_book_id(book_id_or_url)
     if not book_id:
         print("❌ 错误: 未提供有效的书籍 ID 或链接")
         return False
 
-    root, texts = read_book(book_id)
+    root, texts = read_book(book_id, dir_suffix)
     if not texts:
-        print(f"❌ 错误: 未找到该书籍已抓取的章节文件，请先运行抓取！(路径: output/{book_id}_v2/chapters/)")
+        print(f"❌ 错误: 未找到该书籍已抓取的章节文件，请先运行抓取！(路径: output/{book_id}{dir_suffix}/chapters/)")
         return False
 
     meta_path = os.path.join(root, "meta.json")
@@ -465,9 +467,9 @@ async def main(book_id_or_url):
             intro = m.get("intro", "")
 
     print(f"\n📦 开始导出全格式电子书: 《{title}》")
-    build_markdown_files(book_id, title, texts)
-    build_epub(book_id, root, title, author, texts)
-    await build_pdf(book_id, root, title, author, intro, texts)
+    build_markdown_files(book_id, title, texts, out_tag)
+    build_epub(book_id, root, title, author, texts, out_tag)
+    await build_pdf(book_id, root, title, author, intro, texts, out_tag)
     print(f"\n🎉 恭喜！全格式电子书已生成完毕，保存在: output/ 目录\n")
     return True
 

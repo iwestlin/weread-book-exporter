@@ -72,6 +72,19 @@ python main.py https://weread.qq.com/web/reader/3b132980813ab94eeg013129
 
 *(高级用法：如需分步运行，也可单独执行 `python crawl_weread.py <链接或ID>` 与 `python export_book.py <链接或ID>`)*
 
+### 3. 只抓取指定章节（如仅最后两章）
+
+```bash
+# 只抓目录最后 2 章
+python main.py <链接或ID> --last 2
+
+# 按标题关键字或目录序号（从 1 开始）抓取一个区间
+python main.py <链接或ID> --from "第三章" --to "第五章"
+python main.py <链接或ID> --from 10 --to 12
+```
+
+> 节选模式会使用独立的数据目录（`output/<ID>_v2_sel_*`）与导出文件名（带 `（节选）` 标记），不会覆盖已有的全书导出数据。
+
 ---
 
 ## 🛠️ 工作流程

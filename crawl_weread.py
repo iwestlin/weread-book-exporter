@@ -42,6 +42,60 @@ def next_long_pause_at(step):
     return step + random.randint(*LONG_PAUSE_EVERY)
 
 
+def book_dir_for(book_id, dir_suffix="_v2"):
+    return os.path.join(BASE, "output", book_id + dir_suffix)
+
+
+def selection_dir_suffix(last=None, chapter_from=None, chapter_to=None):
+    """按选择参数生成独立目录后缀，避免节选数据与全书数据互相污染，同时便于同名参数断点续传。"""
+    parts = []
+    if last is not None:
+        parts.append("last%d" % int(last))
+    if chapter_from is not None:
+        parts.append("from-%s" % chapter_from)
+    if chapter_to is not None:
+        parts.append("to-%s" % chapter_to)
+    tag = re.sub(r"[^\w\-]", "", "-".join(parts))[:48]
+    return "_v2_sel_" + (tag or "range")
+
+
+def locate_catalog_index(catalog, token):
+    """支持章节序号（1 起）或目录标题（精确 / 包含匹配）定位目录项。"""
+    s = str(token).strip()
+    if s.isdigit():
+        i = int(s) - 1
+        if 0 <= i < len(catalog):
+            return i
+        raise ValueError(f"章节序号 {token} 超出范围 1~{len(catalog)}")
+    for i, t in enumerate(catalog):
+        if norm(t) == norm(s):
+            return i
+    for i, t in enumerate(catalog):
+        if norm(s) in norm(t) or norm(t) in norm(s):
+            return i
+    raise ValueError(f"目录中找不到匹配的章节: {token}")
+
+
+def resolve_catalog_range(catalog, last=None, chapter_from=None, chapter_to=None):
+    """把选择参数解析为目录中的 [起始下标, 结束下标]（含端点）。"""
+    n = len(catalog)
+    if n == 0:
+        return 0, -1
+    if last is not None:
+        last = int(last)
+        if last <= 0 or last > n:
+            raise ValueError(f"--last 需在 1~{n} 之间")
+        return n - last, n - 1
+    start, end = 0, n - 1
+    if chapter_from is not None:
+        start = locate_catalog_index(catalog, chapter_from)
+    if chapter_to is not None:
+        end = locate_catalog_index(catalog, chapter_to)
+    if start > end:
+        raise ValueError("起始章节位于结束章节之后")
+    return start, end
+
+
 def get_crawl_state(book_dir):
     sf = os.path.join(book_dir, "_state.json")
     if os.path.exists(sf):
@@ -62,12 +116,12 @@ def save_crawl_state(book_dir, state):
         print(f"⚠️ 保存状态失败: {e}")
 
 
-def rebuild_chapters_from_raw(book_id):
+def rebuild_chapters_from_raw(book_id, dir_suffix="_v2"):
     """
     从 raw/page_*.json 中恢复并重新生成所有章节 chapters/*.md 与 raw/chap_*.json
     即使爬取过程异常终止，也可完整抢救出所有已捕获的章节内容。
     """
-    book_dir = os.path.join(BASE, "output", book_id + "_v2")
+    book_dir = book_dir_for(book_id, dir_suffix)
     raw_dir = os.path.join(book_dir, "raw")
     md_dir = os.path.join(book_dir, "chapters")
     os.makedirs(md_dir, exist_ok=True)
@@ -227,6 +281,11 @@ HOOK = """
     };
     window.__wr_drain = function() {
         var out = window.__wr_chars;
+        window.__wr_chars = [];
+        return out;
+    };
+    window.__wr_drain_since = function(s) {
+        var out = window.__wr_chars.filter(function(c) { return c.seq > s; });
         window.__wr_chars = [];
         return out;
     };
@@ -417,6 +476,9 @@ def render_md(title, blocks, ch_idx):
                     out.append("")
         buf, buf_cls = [], None
 
+    if blocks and blocks[0].get("type") == "line" and norm(blocks[0].get("text", "")) == norm(title):
+        blocks = blocks[1:]
+
     imgs = []
     for b in blocks:
         if b["type"] == "img":
@@ -501,13 +563,17 @@ async def launch_browser_context(p, user_data_dir, headless=False):
     raise RuntimeError(f"未能启动浏览器 ({last_err})。请安装 Google Chrome 或 Microsoft Edge，或执行: playwright install chromium")
 
 
-async def main(book_id_or_url, force=False):
+async def main(book_id_or_url, force=False, last=None, chapter_from=None, chapter_to=None, dir_suffix="_v2"):
     book_id = extract_book_id(book_id_or_url)
     if not book_id:
         print("❌ 错误: 未能解析出有效的微信读书书籍 ID 或链接")
         return False
 
-    book_dir = os.path.join(BASE, "output", book_id + "_v2")
+    selective = last is not None or chapter_from is not None or chapter_to is not None
+    if selective and dir_suffix == "_v2":
+        dir_suffix = selection_dir_suffix(last, chapter_from, chapter_to)
+
+    book_dir = book_dir_for(book_id, dir_suffix)
     md_dir = os.path.join(book_dir, "chapters")
     raw_dir = os.path.join(book_dir, "raw")
     img_dir = os.path.join(book_dir, "images")
@@ -524,7 +590,7 @@ async def main(book_id_or_url, force=False):
     # 1. 自愈检查：若存在 raw 页面落盘但 chapters 为空，自动重构
     if not existing_mds and raw_pages:
         print(f"🔄 检测到存在历史逐页落盘数据 ({len(raw_pages)} 页)，正在恢复章节数据...")
-        rebuild_chapters_from_raw(book_id)
+        rebuild_chapters_from_raw(book_id, dir_suffix)
         existing_mds = sorted([f for f in os.listdir(md_dir) if f.endswith(".md")])
         state = get_crawl_state(book_dir)
 
@@ -617,7 +683,18 @@ async def main(book_id_or_url, force=False):
             json.dump(catalog, f, ensure_ascii=False, indent=2)
         print(f"📑 目录共 {n} 项: {catalog[:3]} ... {catalog[-2:] if n > 3 else ''}", flush=True)
 
-        # 断点续传智能计算：匹配已完成的章节
+        # 解析抓取范围（默认全书；--last / --from / --to 可只抓指定章节）
+        try:
+            sel_start, sel_end = resolve_catalog_range(catalog, last, chapter_from, chapter_to)
+        except ValueError as e:
+            print(f"❌ 章节选择无效: {e}")
+            await ctx.close()
+            return False
+        if selective and catalog:
+            print(f"🎯 已限定抓取范围: 目录第 {sel_start + 1}~{sel_end + 1} 项 "
+                  f"《{catalog[sel_start]}》 → 《{catalog[sel_end]}》", flush=True)
+
+        # 断点续传智能计算：在所选范围内匹配已完成的章节
         existing_chap_files = sorted([f for f in os.listdir(raw_dir) if f.startswith("chap_") and f.endswith(".json")])
         completed_titles = []
         for cf in existing_chap_files:
@@ -629,18 +706,23 @@ async def main(book_id_or_url, force=False):
             except Exception:
                 pass
 
-        resume_cat_idx = 0
+        resume_cat_idx = sel_start
         if completed_titles and catalog:
             last_done_norm = norm(completed_titles[-1])
-            for ci, cat in enumerate(catalog):
+            for ci in range(sel_start, sel_end + 1):
+                cat = catalog[ci]
                 if norm(cat) == last_done_norm or last_done_norm.startswith(norm(cat)):
                     resume_cat_idx = ci + 1
                     break
-            if resume_cat_idx >= n:
-                print(f"🎉 目录所有 {n} 个章节此前均已全部抓取完成！")
+            if resume_cat_idx > sel_end:
+                if selective:
+                    print(f"🎉 所选章节此前均已抓取完成（{catalog[sel_start]} → {catalog[sel_end]}）")
+                else:
+                    print(f"🎉 目录所有 {n} 个章节此前均已全部抓取完成！")
                 save_crawl_state(book_dir, {
                     "book_id": book_id,
                     "completed": True,
+                    "selected": selective,
                     "saved_chapter_count": len(completed_titles),
                     "total_words": state.get("total_words", 0)
                 })
@@ -648,15 +730,23 @@ async def main(book_id_or_url, force=False):
                 download_all_images(raw_dir, img_dir)
                 return True
 
-        if resume_cat_idx > 0 and n > 0:
+        if resume_cat_idx > sel_start and n > 0:
             print("\n" + "="*55)
             print(f"🔄 检测到未完成进度，执行【真·断点续传】：")
             print(f"   - 历史已完成: {len(completed_titles)} 卷/章 (已落盘至 chapters/ 目录)")
             print(f"   - 续跑跳转点: 目录第 {resume_cat_idx + 1}/{n} 项《{catalog[resume_cat_idx]}》")
             print("="*55 + "\n", flush=True)
-            nav_idx = min(resume_cat_idx, n - 1)
+            nav_idx = min(resume_cat_idx, sel_end)
         else:
-            nav_idx = 0
+            nav_idx = sel_start if catalog else 0
+
+        # 记录导航前的绘制序号：导航后只采纳新画面，过滤掉阅读器此前缓存的旧页
+        try:
+            await page.evaluate("() => window.__wr_drain()")
+            await asyncio.sleep(0.2)
+            seq0 = await page.evaluate("() => window.__wr_seq")
+        except Exception:
+            seq0 = 0
 
         # 平稳导航至目标章节（首章或续跑断点）
         if n > 0:
@@ -682,7 +772,10 @@ async def main(book_id_or_url, force=False):
         stale = 0
         seen_last = False
         last_after_seen = 0
-        last_cat = norm(catalog[-1]) if catalog else ""
+        last_cat = norm(catalog[sel_end]) if catalog and sel_end >= 0 else ""
+        if catalog and sel_start > 0:
+            # 把所选范围之前的目录项标记为已见，避免正文误命中前序章节标题
+            seen_titles.update(catalog[:sel_start])
         seen_page_sigs = set()
         seen_imgs = set()
 
@@ -691,6 +784,7 @@ async def main(book_id_or_url, force=False):
         total_words_accum = state.get("total_words", 0) if resume_cat_idx > 0 else 0
         t_start = time.time()
         long_pause_at = next_long_pause_at(start_step)
+        first_capture = True
 
         print(f"\n🚀 开始遍历抓取页面 (从第 {start_step} 页开始)...", flush=True)
 
@@ -707,7 +801,13 @@ async def main(book_id_or_url, force=False):
                     long_pause_at = next_long_pause_at(step)
 
             ok = await wait_stable_chars(page, timeout=2.2 if step > start_step else 5.0)
-            chars = await page.evaluate("() => window.__wr_drain()") if ok else []
+            if first_capture:
+                chars = await page.evaluate("(s) => window.__wr_drain_since(s)", seq0) if ok else []
+                if not chars:
+                    chars = await page.evaluate("() => window.__wr_drain()") if ok else []
+                first_capture = False
+            else:
+                chars = await page.evaluate("() => window.__wr_drain()") if ok else []
             imgs = await page.evaluate(IMGS_JS)
 
             pages = split_pages(chars)
@@ -717,6 +817,7 @@ async def main(book_id_or_url, force=False):
             got_any = False
             step_words = 0
             page_blocks = []
+            reached_end = False
 
             for side, pchars in pages:
                 lines = page_lines(pchars)
@@ -745,6 +846,7 @@ async def main(book_id_or_url, force=False):
                         new_title = txt
 
                     if is_new_chapter:
+                        finished_end = False
                         if buf:
                             # 实时落盘刚完成的章节
                             saved_idx += 1
@@ -764,11 +866,17 @@ async def main(book_id_or_url, force=False):
                                 "seen_titles": list(seen_titles),
                                 "total_words": total_words_accum,
                             })
+                            if selective and last_cat and norm(cur_title) == last_cat:
+                                finished_end = True
                         buf = []
+                        if finished_end:
+                            print("\n  🏁 所选范围末章已抓取完毕，停止翻页", flush=True)
+                            reached_end = True
+                            break
                         cur_title = new_title
                         seen_titles.add(cur_title)
                         print(f"\n  📑 [第 {step:03d} 页] 识别新章节: 《{cur_title}》", flush=True)
-                        if last_cat and norm(cur_title) == last_cat:
+                        if not selective and last_cat and norm(cur_title) == last_cat:
                             seen_last = True
 
                         if remainder:
@@ -793,7 +901,7 @@ async def main(book_id_or_url, force=False):
                         page_blocks.append(img_blk)
                         got_any = True
 
-            if not pages and imgs:
+            if not reached_end and not pages and imgs:
                 for im in imgs:
                     if im["src"] not in seen_imgs:
                         seen_imgs.add(im["src"])
@@ -815,6 +923,9 @@ async def main(book_id_or_url, force=False):
                         "blocks": page_blocks,
                         "lines": [b["text"] for b in page_blocks if b.get("type") == "line"],
                     }, pf, ensure_ascii=False)
+
+            if reached_end:
+                break
 
             # 实时可见的进度输出
             elapsed_sec = int(time.time() - t_start)
@@ -849,6 +960,7 @@ async def main(book_id_or_url, force=False):
         save_crawl_state(book_dir, {
             "book_id": book_id,
             "completed": True,
+            "selected": selective,
             "last_step": step,
             "saved_chapter_count": saved_idx,
             "last_title": cur_title,
@@ -857,7 +969,10 @@ async def main(book_id_or_url, force=False):
         })
 
         print(f"\n" + "="*50)
-        print(f"🎉 抓取成功！全书已保存 {saved_idx} 个章节，累计 {total_words_accum} 字")
+        if selective:
+            print(f"🎉 指定章节抓取成功！已保存 {saved_idx} 个章节，累计 {total_words_accum} 字")
+        else:
+            print(f"🎉 抓取成功！全书已保存 {saved_idx} 个章节，累计 {total_words_accum} 字")
         print("="*50)
         await ctx.close()
 
@@ -866,19 +981,35 @@ async def main(book_id_or_url, force=False):
     return True
 
 
+def _parse_opt(argv, name):
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python crawl_weread.py <微信读书链接或ID> [--force] [--rebuild]")
+        print("用法: python crawl_weread.py <微信读书链接或ID> [--force] [--rebuild] "
+              "[--last N | --from 章节 --to 章节]")
         sys.exit(1)
 
     force_flag = "--force" in sys.argv or "-f" in sys.argv
     rebuild_flag = "--rebuild" in sys.argv
+    last_raw = _parse_opt(sys.argv, "--last")
+    from_raw = _parse_opt(sys.argv, "--from")
+    to_raw = _parse_opt(sys.argv, "--to")
+    last = int(last_raw) if last_raw is not None else None
 
-    bid = [a for a in sys.argv[1:] if not a.startswith("-")][0]
+    bid = [a for a in sys.argv[1:] if not a.startswith("-")]
+    bid = bid[0] if bid else ""
     extracted = extract_book_id(bid)
 
     if rebuild_flag:
-        cnt = rebuild_chapters_from_raw(extracted)
+        cnt = rebuild_chapters_from_raw(extracted, selection_dir_suffix(last, from_raw, to_raw))
         print(f"🎉 已成功从 raw/ 页面落盘数据恢复 {cnt} 个章节！")
     else:
-        asyncio.run(main(extracted, force=force_flag))
+        asyncio.run(main(extracted, force=force_flag, last=last,
+                         chapter_from=from_raw, chapter_to=to_raw))
